@@ -2,9 +2,7 @@
 
 set -euo pipefail
 
-MODE="${1:-}"
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 LAB_DIR="/tmp/lte-lab"
@@ -14,674 +12,467 @@ SRSRAN_DIR="$PROJECT_DIR/srsRAN_4G"
 ENB_CONF="$CONFIG_DIR/enb.conf"
 UE_CONF="$CONFIG_DIR/ue.conf"
 
+MME_ADDR="127.0.0.2"
+MME_SCTP_PORT="36412"
+
+IMSI="901700123456789"
+K="00112233445566778899AABBCCDDEEFF"
+OPC="63BFA50EE6523365FF14C1F45F88737D"
+APN="internet"
+
+MCC="901"
+MNC="70"
+TAC="7"
+
+mkdir -p "$LAB_DIR" "$CONFIG_DIR"
+
 log() {
     echo
     echo "============================================================"
     echo "$1"
     echo "============================================================"
-    echo
 }
 
 prepare_srsran_configs() {
-
     log "Preparing srsRAN configuration files"
 
-    mkdir -p "$CONFIG_DIR"
-
-    if [ ! -d "$SRSRAN_DIR" ]; then
-        echo "ERROR: srsRAN_4G directory not found:"
-        echo "$SRSRAN_DIR"
-        exit 1
+    if [[ ! -f "$CONFIG_DIR/enb.conf" ]]; then
+        cp "$SRSRAN_DIR/srsenb/enb.conf.example" "$CONFIG_DIR/enb.conf"
     fi
 
-    echo "Using srsRAN source:"
-    echo "$SRSRAN_DIR"
+    if [[ ! -f "$CONFIG_DIR/sib.conf" ]]; then
+        cp "$SRSRAN_DIR/srsenb/sib.conf.example" "$CONFIG_DIR/sib.conf"
+    fi
 
-    ENB_EXAMPLE="$SRSRAN_DIR/srsenb/enb.conf.example"
-    SIB_EXAMPLE="$SRSRAN_DIR/srsenb/sib.conf.example"
-    RR_EXAMPLE="$SRSRAN_DIR/srsenb/rr.conf.example"
-    RB_EXAMPLE="$SRSRAN_DIR/srsenb/rb.conf.example"
-    UE_EXAMPLE="$SRSRAN_DIR/srsue/ue.conf.example"
+    if [[ ! -f "$CONFIG_DIR/rr.conf" ]]; then
+        cp "$SRSRAN_DIR/srsenb/rr.conf.example" "$CONFIG_DIR/rr.conf"
+    fi
 
-    for file in \
-        "$ENB_EXAMPLE" \
-        "$SIB_EXAMPLE" \
-        "$RR_EXAMPLE" \
-        "$RB_EXAMPLE" \
-        "$UE_EXAMPLE"
-    do
-        if [ ! -f "$file" ]; then
-            echo "ERROR: Missing srsRAN example:"
-            echo "$file"
-            exit 1
-        fi
-    done
+    if [[ ! -f "$CONFIG_DIR/rb.conf" ]]; then
+        cp "$SRSRAN_DIR/srsenb/rb.conf.example" "$CONFIG_DIR/rb.conf"
+    fi
 
-    echo
-    echo "Copying version-matched srsRAN examples..."
+    if [[ ! -f "$CONFIG_DIR/ue.conf" ]]; then
+        cp "$SRSRAN_DIR/srsue/ue.conf.example" "$CONFIG_DIR/ue.conf"
+    fi
 
-    cp "$ENB_EXAMPLE" "$ENB_CONF"
-    cp "$SIB_EXAMPLE" "$CONFIG_DIR/sib.conf"
-    cp "$RR_EXAMPLE" "$CONFIG_DIR/rr.conf"
-    cp "$RB_EXAMPLE" "$CONFIG_DIR/rb.conf"
-    cp "$UE_EXAMPLE" "$UE_CONF"
-
-    echo "srsRAN configuration files created."
-
-    echo
-    echo "Patching eNB configuration..."
-
-    python3 - "$ENB_CONF" <<'PY'
-from pathlib import Path
+    python3 - "$ENB_CONF" "$UE_CONF" <<'PY'
 import sys
+from pathlib import Path
 
-path = Path(sys.argv[1])
-text = path.read_text()
+enb = Path(sys.argv[1])
+ue = Path(sys.argv[2])
 
-def replace(text, old, new):
-    if old in text:
-        return text.replace(old, new, 1)
-    return text
+def replace_or_add(text, key, value):
+    lines = text.splitlines()
+    found = False
+    out = []
 
-text = replace(text, "mcc = 001", "mcc = 901")
-text = replace(text, "mnc = 01", "mnc = 70")
+    for line in lines:
+        stripped = line.strip()
 
-text = replace(text, "#device_name = zmq", "device_name = zmq")
-text = replace(
+        if stripped.startswith(key) and "=" in stripped:
+            indent = line[:len(line) - len(line.lstrip())]
+            out.append(f"{indent}{key} = {value}")
+            found = True
+        else:
+            out.append(line)
+
+    if not found:
+        out.append(f"{key} = {value}")
+
+    return "\n".join(out) + "\n"
+
+text = enb.read_text()
+
+text = replace_or_add(text, "mme_addr", "127.0.0.2")
+text = replace_or_add(
     text,
-    "#device_args = fail_on_disconnect=true,tx_port=tcp://*:2000,rx_port=tcp://localhost:2001,id=enb,base_srate=23.04e6",
-    "device_args = fail_on_disconnect=true,tx_port=tcp://*:2000,rx_port=tcp://127.0.0.1:2001,id=enb,base_srate=23.04e6"
+    "device_args",
+    "fail_on_disconnect=true,tx_port=tcp://*:2000,rx_port=tcp://127.0.0.1:2001,id=enb,base_srate=23.04e6"
 )
 
-path.write_text(text)
-PY
+# Make sure the test PLMN is used.
+text = text.replace("mcc = 001", "mcc = 901")
+text = text.replace("mnc = 01", "mnc = 70")
 
-    echo
-    echo "Patching RR configuration..."
+enb.write_text(text)
 
-    python3 - "$CONFIG_DIR/rr.conf" <<'PY'
-from pathlib import Path
-import sys
+text = ue.read_text()
 
-path = Path(sys.argv[1])
-text = path.read_text()
-
-text = text.replace("tac = 0x0001", "tac = 0x0007")
-text = text.replace("tac = 0x0007", "tac = 0x0007")
-
-path.write_text(text)
-PY
-
-    echo
-    echo "Patching UE configuration..."
-
-    python3 - "$UE_CONF" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-text = path.read_text()
-
-def replace(text, old, new):
-    if old in text:
-        return text.replace(old, new, 1)
-    return text
-
-# ZMQ
-text = replace(text, "#device_name = zmq", "device_name = zmq")
-
-text = replace(
+text = replace_or_add(
     text,
-    "#device_args = tx_port=tcp://*:2001,rx_port=tcp://localhost:2000,id=ue,base_srate=23.04e6",
-    "device_args = tx_port=tcp://*:2001,rx_port=tcp://127.0.0.1:2000,id=ue,base_srate=23.04e6"
+    "device_args",
+    "tx_port=tcp://*:2001,rx_port=tcp://127.0.0.1:2000,id=ue,base_srate=23.04e6"
 )
 
-# USIM
-text = replace(text, "imsi = 001010123456780", "imsi = 901700123456789")
-text = replace(
-    text,
-    "opc  = 63BFA50EE6523365FF14C1F45F88737D",
-    "opc  = 63BFA50EE6523365FF14C1F45F88737D"
-)
-text = replace(
-    text,
-    "k    = 00112233445566778899aabbccddeeff",
-    "k    = 00112233445566778899aabbccddeeff"
-)
+text = replace_or_add(text, "imsi", "901700123456789")
+text = replace_or_add(text, "apn", "internet")
 
-# APN
-text = replace(text, "apn = srsapn", "apn = internet")
-
-# Remove old invalid pcap.filename if present.
-lines = []
-for line in text.splitlines():
-    stripped = line.strip()
-
-    if stripped.startswith("filename =") and "[pcap]" in "":
-        continue
-
-    if stripped == "pcap.filename":
-        continue
-
-    lines.append(line)
-
-text = "\n".join(lines) + "\n"
-
-path.write_text(text)
+ue.write_text(text)
 PY
 
-    echo
-    echo "Forcing valid UE PCAP configuration..."
-
-    python3 - "$UE_CONF" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-text = path.read_text()
-
-lines = text.splitlines()
-
-out = []
-inside_pcap = False
-
-for line in lines:
-
-    stripped = line.strip()
-
-    if stripped.startswith("["):
-        inside_pcap = stripped == "[pcap]"
-
-    if inside_pcap:
-        if stripped.startswith("filename ="):
-            continue
-
-    out.append(line)
-
-text = "\n".join(out) + "\n"
-
-path.write_text(text)
-PY
+    # Remove pcap filename because recent srsUE rejects invalid/default
+    # pcap filename configurations.
+    sed -i '/^[[:space:]]*filename[[:space:]]*=/d' "$UE_CONF"
 
     echo
-    echo "Checking generated configuration files..."
-
-    ls -lh \
-        "$ENB_CONF" \
-        "$CONFIG_DIR/sib.conf" \
-        "$CONFIG_DIR/rr.conf" \
-        "$CONFIG_DIR/rb.conf" \
-        "$UE_CONF"
+    echo "eNB MME configuration:"
+    grep -nE '^[[:space:]]*mme_addr[[:space:]]*=' "$ENB_CONF" || true
 
     echo
-    echo "============================================================"
-    echo "eNB RF configuration"
-    echo "============================================================"
-
-    grep -A8 -B3 \
-        -E "device_name|device_args" \
-        "$ENB_CONF" || true
+    echo "eNB ZMQ configuration:"
+    grep -nE '^[[:space:]]*device_args[[:space:]]*=' "$ENB_CONF" || true
 
     echo
-    echo "============================================================"
-    echo "UE RF configuration"
-    echo "============================================================"
-
-    grep -A8 -B3 \
-        -E "device_name|device_args" \
-        "$UE_CONF" || true
-
-    echo
-    echo "============================================================"
-    echo "UE USIM"
-    echo "============================================================"
-
-    grep -A12 \
-        "^\[usim\]" \
-        "$UE_CONF" || true
-
-    echo
-    echo "srsRAN configuration preparation complete."
+    echo "UE ZMQ configuration:"
+    grep -nE '^[[:space:]]*device_args[[:space:]]*=' "$UE_CONF" || true
 }
 
-prepare() {
+prepare_open5gs() {
+    log "Preparing Open5GS"
 
-    log "Preparing LTE Lab"
+    mkdir -p "$LAB_DIR/open5gs"
 
-    mkdir -p "$LAB_DIR"
+    # Configure MME PLMN and TAC.
+    if [[ -f /etc/open5gs/mme.yaml ]]; then
+        cp /etc/open5gs/mme.yaml "$LAB_DIR/mme.yaml.backup" || true
 
-    rm -f "$LAB_DIR"/*.log
-    rm -f "$LAB_DIR"/*.pcap
-    rm -f "$LAB_DIR"/*.pcapng
-    rm -f "$LAB_DIR"/*.pid
-
-    echo "Cleaning previous processes..."
-
-    sudo pkill -x srsue 2>/dev/null || true
-    sudo pkill -x srsenb 2>/dev/null || true
-
-    ip netns del ue1 2>/dev/null || true
-    ip link del ogstun 2>/dev/null || true
-
-    prepare_srsran_configs
-
-    echo
-    echo "Configuring Open5GS MME PLMN/TAC..."
-
-    sudo python3 - <<'PY'
+        python3 - <<'PY'
 from pathlib import Path
 
 path = Path("/etc/open5gs/mme.yaml")
+
+if path.exists():
+    text = path.read_text()
+
+    text = text.replace(
+        "mcc: 999",
+        "mcc: 901"
+    )
+
+    text = text.replace(
+        "mnc: 70",
+        "mnc: 70"
+    )
+
+    path.write_text(text)
+PY
+    fi
+
+    # Ensure the MME configuration contains the required test PLMN/TAC.
+    python3 - <<'PY'
+from pathlib import Path
+
+path = Path("/etc/open5gs/mme.yaml")
+
+if not path.exists():
+    raise SystemExit("Open5GS MME configuration not found")
+
 text = path.read_text()
 
-lines = text.splitlines()
+# Keep the existing configuration intact and only normalize the
+# test PLMN/TAC values where they already occur.
+text = text.replace(
+    "mcc: 001",
+    "mcc: 901"
+)
 
-section = None
+text = text.replace(
+    "mnc: 01",
+    "mnc: 70"
+)
 
-for i, line in enumerate(lines):
-
-    if line.strip() == "gummei:":
-        section = "gummei"
-        continue
-
-    if line.strip() == "tai:":
-        section = "tai"
-        continue
-
-    if section == "gummei":
-
-        if "mcc:" in line and not line.lstrip().startswith("#"):
-            lines[i] = "        mcc: 901"
-
-        elif "mnc:" in line and not line.lstrip().startswith("#"):
-            lines[i] = "        mnc: 70"
-
-    elif section == "tai":
-
-        if "mcc:" in line and not line.lstrip().startswith("#"):
-            lines[i] = "        mcc: 901"
-
-        elif "mnc:" in line and not line.lstrip().startswith("#"):
-            lines[i] = "        mnc: 70"
-
-        elif "tac:" in line and not line.lstrip().startswith("#"):
-            lines[i] = "      tac: 7"
-
-path.write_text("\n".join(lines) + "\n")
+path.write_text(text)
 PY
 
-    echo
-    echo "MME PLMN/TAC:"
-
-    sudo grep -A18 -E \
-        "gummei:|tai:" \
-        /etc/open5gs/mme.yaml || true
-
-    echo
-    echo "Creating UE network namespace..."
-
+    # Test namespace used by the UE.
+    ip netns del ue1 2>/dev/null || true
     ip netns add ue1
 
-    echo
-    echo "Creating Open5GS TUN interface..."
+    # Create the Open5GS tunnel interface if it does not already exist.
+    ip link del ogstun 2>/dev/null || true
 
     ip tuntap add name ogstun mode tun
     ip addr add 10.45.0.1/16 dev ogstun
     ip link set ogstun up
 
-    echo
-    echo "Enabling IPv4 forwarding..."
+    # Enable forwarding.
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
-    sudo sysctl -w net.ipv4.ip_forward=1
+    # NAT for the simulated UE network.
+    iptables -t nat -D POSTROUTING -s 10.45.0.0/16 -j MASQUERADE 2>/dev/null || true
+    iptables -t nat -A POSTROUTING -s 10.45.0.0/16 -j MASQUERADE
 
-    echo
-    echo "Adding NAT..."
-
-    sudo iptables -t nat -D POSTROUTING \
-        -s 10.45.0.0/16 \
-        ! -o ogstun \
-        -j MASQUERADE \
-        2>/dev/null || true
-
-    sudo iptables -t nat -A POSTROUTING \
-        -s 10.45.0.0/16 \
-        ! -o ogstun \
-        -j MASQUERADE
-
-    echo
-    echo "Creating test subscriber..."
-
-    mongosh \
-      --quiet \
-      --eval '
-        db = db.getSiblingDB("open5gs");
-
-        db.subscribers.deleteMany({
-          imsi: "901700123456789"
-        });
-
-        db.subscribers.insertOne({
-          imsi: "901700123456789",
-
-          security: {
-            k: "00112233445566778899AABBCCDDEEFF",
-            opc: "63BFA50EE6523365FF14C1F45F88737D",
-            amf: "8000"
-          },
-
-          ambr: {
-            downlink: {
-              value: 1,
-              unit: 3
-            },
-            uplink: {
-              value: 1,
-              unit: 3
-            }
-          },
-
-          slice: [
+    # Insert test subscriber.
+    if command -v mongosh >/dev/null 2>&1; then
+        mongosh open5gs --quiet <<EOF || true
+db.subscribers.updateOne(
+  { imsi: "$IMSI" },
+  {
+    \$set: {
+      imsi: "$IMSI",
+      security: {
+        k: "$K",
+        opc: "$OPC",
+        amf: "8000"
+      },
+      slice: [
+        {
+          sst: 1,
+          default_indicator: true,
+          session: [
             {
-              sst: 1,
-              default_indicator: true,
-
-              session: [
-                {
-                  name: "internet",
-                  type: 3,
-
-                  qos: {
-                    index: 9,
-                    arp: 1
-                  }
+              name: "$APN",
+              type: 3,
+              qos: {
+                index: 9,
+                arp: {
+                  priority: 8,
+                  pre_emption_capability: 1,
+                  pre_emption_vulnerability: 1
                 }
-              ]
+              }
             }
           ]
-        });
-      ' \
-      > "$LAB_DIR/subscriber.log" 2>&1
-
-    echo
-    echo "Subscriber database result:"
-    cat "$LAB_DIR/subscriber.log" || true
-
-    echo
-    echo "Preparation complete."
+        }
+      ]
+    }
+  },
+  { upsert: true }
+)
+EOF
+    elif command -v mongo >/dev/null 2>&1; then
+        mongo open5gs --quiet <<EOF || true
+db.subscribers.updateOne(
+  { imsi: "$IMSI" },
+  {
+    \$set: {
+      imsi: "$IMSI",
+      security: {
+        k: "$K",
+        opc: "$OPC",
+        amf: "8000"
+      }
+    }
+  },
+  { upsert: true }
+)
+EOF
+    fi
 }
 
 start_core() {
+    log "Starting Open5GS core"
 
-    log "Starting Open5GS 4G EPC"
+    systemctl restart mongod || true
+    sleep 2
 
-    echo "Stopping old Open5GS processes..."
+    systemctl restart open5gs-hssd || true
+    systemctl restart open5gs-pcrfd || true
+    systemctl restart open5gs-mmed || true
+    systemctl restart open5gs-sgwcd || true
+    systemctl restart open5gs-smfd || true
+    systemctl restart open5gs-sgwud || true
+    systemctl restart open5gs-upfd || true
 
-    sudo systemctl stop open5gs-mmed 2>/dev/null || true
-    sudo systemctl stop open5gs-sgwcd 2>/dev/null || true
-    sudo systemctl stop open5gs-smfd 2>/dev/null || true
-    sudo systemctl stop open5gs-sgwud 2>/dev/null || true
-    sudo systemctl stop open5gs-upfd 2>/dev/null || true
-    sudo systemctl stop open5gs-hssd 2>/dev/null || true
-    sudo systemctl stop open5gs-pcrfd 2>/dev/null || true
-
-    echo
-    echo "Starting MongoDB..."
-
-    sudo systemctl restart mongod
+    sleep 5
 
     echo
-    echo "Starting HSS..."
-
-    sudo systemctl restart open5gs-hssd
-
-    echo
-    echo "Starting PCRF..."
-
-    sudo systemctl restart open5gs-pcrfd
+    echo "Open5GS service status:"
+    systemctl --no-pager --full status open5gs-mmed || true
 
     echo
-    echo "Starting MME..."
+    echo "Checking MME SCTP listener..."
 
-    sudo systemctl restart open5gs-mmed
+    if command -v ss >/dev/null 2>&1; then
+        ss -lnp | grep -E '127\.0\.0\.2:36412|36412' || true
+    fi
+}
 
-    echo
-    echo "Starting SGW Control Plane..."
+check_mme() {
+    log "Checking MME S1 endpoint"
 
-    sudo systemctl restart open5gs-sgwcd
-
-    echo
-    echo "Starting SMF / PGW Control Plane..."
-
-    sudo systemctl restart open5gs-smfd
-
-    echo
-    echo "Starting SGW User Plane..."
-
-    sudo systemctl restart open5gs-sgwud
+    echo "Expected MME:"
+    echo "  Address : $MME_ADDR"
+    echo "  SCTP    : $MME_SCTP_PORT"
 
     echo
-    echo "Starting UPF / PGW User Plane..."
+    echo "Current SCTP listeners:"
 
-    sudo systemctl restart open5gs-upfd
+    if command -v ss >/dev/null 2>&1; then
+        ss -lnp | grep -E 'sctp|36412' || true
+    fi
+
+    echo
+
+    # Do not fail the complete lab only because ss output formatting differs.
+    # The important check is whether the MME listener exists.
+    if ss -Hlnp 2>/dev/null | grep -qE "127\.0\.0\.2:${MME_SCTP_PORT}"; then
+        echo "MME SCTP listener detected on $MME_ADDR:$MME_SCTP_PORT"
+    else
+        echo "WARNING: MME SCTP listener was not detected on $MME_ADDR:$MME_SCTP_PORT"
+        echo "Open5GS MME may still be starting. Waiting..."
+        sleep 3
+
+        if ss -Hlnp 2>/dev/null | grep -qE "127\.0\.0\.2:${MME_SCTP_PORT}"; then
+            echo "MME SCTP listener detected after waiting."
+        else
+            echo "WARNING: MME SCTP listener is still not visible."
+            echo "Continuing so the srsENB log can show the actual failure."
+        fi
+    fi
+}
+
+start_enb() {
+    log "Starting srsENB"
+
+    # Force the correct MME address one more time immediately before
+    # starting srsENB. This prevents an old generated config from being used.
+    python3 - "$ENB_CONF" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text()
+
+lines = text.splitlines()
+found = False
+out = []
+
+for line in lines:
+    if line.strip().startswith("mme_addr") and "=" in line:
+        indent = line[:len(line) - len(line.lstrip())]
+        out.append(f"{indent}mme_addr = 127.0.0.2")
+        found = True
+    else:
+        out.append(line)
+
+if not found:
+    out.append("mme_addr = 127.0.0.2")
+
+path.write_text("\n".join(out) + "\n")
+PY
+
+    echo
+    echo "Final eNB MME address:"
+    grep -nE '^[[:space:]]*mme_addr[[:space:]]*=' "$ENB_CONF"
+
+    echo
+    echo "Starting srsENB..."
+
+    (
+        cd "$CONFIG_DIR"
+        exec srsenb "$ENB_CONF"
+    ) > "$LAB_DIR/srsenb.log" 2>&1 &
+
+    ENB_PID=$!
+    echo "$ENB_PID" > "$LAB_DIR/srsenb.pid"
+
+    echo "srsENB PID: $ENB_PID"
 
     sleep 8
 
     echo
-    echo "============================================================"
-    echo "Open5GS Processes"
-    echo "============================================================"
-
-    ps aux | grep open5gs | grep -v grep || true
-
-    echo
-    echo "============================================================"
-    echo "Open5GS Services"
-    echo "============================================================"
-
-    systemctl --no-pager --type=service \
-        | grep open5gs || true
-
-    echo
-    echo "============================================================"
-    echo "LTE Core Sockets"
-    echo "============================================================"
-
-    ss -lntup | grep -E \
-        '36412|2123|2152|3868|8805' \
-        || true
-
-    echo
-    echo "============================================================"
-    echo "MME PLMN/TAC"
-    echo "============================================================"
-
-    sudo grep -A18 -E \
-        "gummei:|tai:" \
-        /etc/open5gs/mme.yaml || true
-}
-
-start_enb() {
-
-    log "Starting srsENB"
-
-    mkdir -p "$LAB_DIR"
-
-    if pgrep -x srsenb >/dev/null 2>&1; then
-        echo "srsENB is already running."
-        return
-    fi
-
-    if [ ! -f "$ENB_CONF" ]; then
-        echo "ERROR: $ENB_CONF not found."
-        exit 1
-    fi
-
-    for file in \
-        "$CONFIG_DIR/sib.conf" \
-        "$CONFIG_DIR/rr.conf" \
-        "$CONFIG_DIR/rb.conf"
-    do
-        if [ ! -f "$file" ]; then
-            echo "ERROR: Missing eNB configuration:"
-            echo "$file"
-            exit 1
-        fi
-    done
-
-    echo "Starting srsENB from configuration directory..."
-
-    (
-        cd "$CONFIG_DIR"
-
-        srsenb "$ENB_CONF"
-    ) > "$LAB_DIR/srsenb.log" 2>&1 &
-
-    echo $! > "$LAB_DIR/srsenb.pid"
-
-    sleep 10
-
-    echo
-    echo "============================================================"
-    echo "srsENB PROCESS"
-    echo "============================================================"
-
-    pgrep -a -x srsenb || true
-
-    echo
-    echo "============================================================"
-    echo "srsENB LOG"
-    echo "============================================================"
-
-    tail -n 200 \
-        "$LAB_DIR/srsenb.log" || true
-
-    echo
-    echo "============================================================"
-    echo "S1AP SOCKET"
-    echo "============================================================"
-
-    ss -lnp | grep 36412 || true
+    echo "Recent srsENB log:"
+    tail -n 80 "$LAB_DIR/srsenb.log" || true
 }
 
 test_ue() {
-
     log "Starting srsUE"
 
-    if pgrep -x srsue >/dev/null 2>&1; then
-        echo "srsUE is already running."
-        return
-    fi
-
-    if [ ! -f "$UE_CONF" ]; then
-        echo "ERROR: $UE_CONF not found."
-        exit 1
-    fi
-
-    echo "Starting srsUE inside ue1 namespace..."
-
-    timeout 120 \
-        ip netns exec ue1 \
-        bash -c "
+    (
+        ip netns exec ue1 bash -c "
             cd '$CONFIG_DIR'
             exec srsue '$UE_CONF'
-        " \
-        > "$LAB_DIR/srsue.log" 2>&1 \
-        || true
+        "
+    ) > "$LAB_DIR/srsue.log" 2>&1 &
+
+    UE_PID=$!
+    echo "$UE_PID" > "$LAB_DIR/srsue.pid"
+
+    echo "srsUE PID: $UE_PID"
+
+    sleep 15
 
     echo
-    echo "============================================================"
-    echo "srsUE RESULT"
-    echo "============================================================"
+    echo "Recent srsUE log:"
+    tail -n 100 "$LAB_DIR/srsue.log" || true
+}
 
-    cat "$LAB_DIR/srsue.log" || true
-
-    echo
-    echo "============================================================"
-    echo "UE NETWORK INTERFACES"
-    echo "============================================================"
-
-    ip netns exec ue1 ip addr || true
+collect_status() {
+    log "Collecting LTE lab status"
 
     echo
-    echo "============================================================"
-    echo "UE ROUTES"
-    echo "============================================================"
-
-    ip netns exec ue1 ip route || true
+    echo "=== Open5GS MME ==="
+    systemctl --no-pager --full status open5gs-mmed || true
 
     echo
-    echo "============================================================"
-    echo "Open5GS UE INFO"
-    echo "============================================================"
+    echo "=== SCTP ==="
+    ss -lnp 2>/dev/null | grep -E '36412|sctp' || true
 
-    curl -s \
-        "http://127.0.0.2:9090/ue-info?" \
-        || true
+    echo
+    echo "=== srsENB ==="
+    if [[ -f "$LAB_DIR/srsenb.log" ]]; then
+        tail -n 150 "$LAB_DIR/srsenb.log"
+    fi
+
+    echo
+    echo "=== srsUE ==="
+    if [[ -f "$LAB_DIR/srsue.log" ]]; then
+        tail -n 150 "$LAB_DIR/srsue.log"
+    fi
+
+    echo
+    echo "=== Network ==="
+    ip addr show ogstun 2>/dev/null || true
+
+    echo
+    echo "=== Open5GS API UE info ==="
+    curl -sS --max-time 5 \
+        http://127.0.0.2:9090/ue-info 2>/dev/null || true
 
     echo
     echo
-    echo "============================================================"
-    echo "Open5GS eNB INFO"
-    echo "============================================================"
-
-    curl -s \
-        "http://127.0.0.2:9090/enb-info?" \
-        || true
+    echo "=== Open5GS API eNB info ==="
+    curl -sS --max-time 5 \
+        http://127.0.0.2:9090/enb-info 2>/dev/null || true
 }
 
 stop() {
+    log "Stopping LTE lab"
 
-    log "Stopping LTE Lab"
+    if [[ -f "$LAB_DIR/srsue.pid" ]]; then
+        kill "$(cat "$LAB_DIR/srsue.pid")" 2>/dev/null || true
+    fi
 
-    echo "Stopping srsUE..."
+    if [[ -f "$LAB_DIR/srsenb.pid" ]]; then
+        kill "$(cat "$LAB_DIR/srsenb.pid")" 2>/dev/null || true
+    fi
 
-    sudo pkill -x srsue 2>/dev/null || true
-
-    echo "Stopping srsENB..."
-
-    sudo pkill -x srsenb 2>/dev/null || true
-
-    echo "Stopping Open5GS..."
-
-    sudo systemctl stop open5gs-upfd 2>/dev/null || true
-    sudo systemctl stop open5gs-sgwud 2>/dev/null || true
-    sudo systemctl stop open5gs-smfd 2>/dev/null || true
-    sudo systemctl stop open5gs-sgwcd 2>/dev/null || true
-    sudo systemctl stop open5gs-mmed 2>/dev/null || true
-    sudo systemctl stop open5gs-pcrfd 2>/dev/null || true
-    sudo systemctl stop open5gs-hssd 2>/dev/null || true
-
-    echo "Removing UE namespace..."
+    pkill -f "srsue.*ue.conf" 2>/dev/null || true
+    pkill -f "srsenb.*enb.conf" 2>/dev/null || true
 
     ip netns del ue1 2>/dev/null || true
 
-    echo "Removing ogstun..."
+    iptables -t nat -D POSTROUTING -s 10.45.0.0/16 -j MASQUERADE 2>/dev/null || true
 
     ip link del ogstun 2>/dev/null || true
-
-    echo "Removing NAT rule..."
-
-    sudo iptables -t nat -D POSTROUTING \
-        -s 10.45.0.0/16 \
-        ! -o ogstun \
-        -j MASQUERADE \
-        2>/dev/null || true
-
-    echo
-    echo "LTE Lab stopped."
 }
 
-case "$MODE" in
-
+case "${1:-}" in
     prepare)
-        prepare
+        prepare_srsran_configs
+        prepare_open5gs
         ;;
 
     start-core)
         start_core
+        check_mme
         ;;
 
     start-enb)
+        check_mme
         start_enb
         ;;
 
@@ -689,19 +480,33 @@ case "$MODE" in
         test_ue
         ;;
 
+    status)
+        collect_status
+        ;;
+
     stop)
         stop
         ;;
 
+    all)
+        prepare_srsran_configs
+        prepare_open5gs
+        start_core
+        check_mme
+        start_enb
+        test_ue
+        collect_status
+        ;;
+
     *)
         echo "Usage:"
-        echo
         echo "  $0 prepare"
         echo "  $0 start-core"
         echo "  $0 start-enb"
         echo "  $0 test-ue"
+        echo "  $0 status"
         echo "  $0 stop"
+        echo "  $0 all"
         exit 1
         ;;
-
 esac
