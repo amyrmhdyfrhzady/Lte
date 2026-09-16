@@ -9,8 +9,7 @@ on:
 jobs:
   lte-lab:
     runs-on: ubuntu-24.04
-
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
       - name: Checkout
@@ -24,11 +23,15 @@ jobs:
           free -h
           df -h
 
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
           sudo apt-get update
 
           sudo apt-get install -y \
+            software-properties-common \
+            ca-certificates \
+            curl \
+            gnupg \
             git \
             build-essential \
             cmake \
@@ -37,23 +40,13 @@ jobs:
             libmbedtls-dev \
             libsctp-dev \
             libyaml-cpp-dev \
-            libboost-program-options-dev \
-            libboost-system-dev \
-            libboost-thread-dev \
+            libboost-all-dev \
             libzmq3-dev \
             libconfig++-dev \
             libpcsclite-dev \
             libtins-dev \
             libssl-dev \
             libcurl4-openssl-dev \
-            libboost-test-dev \
-            libboost-filesystem-dev \
-            libboost-regex-dev \
-            libboost-serialization-dev \
-            libboost-date-time-dev \
-            libboost-log-dev \
-            libboost-random-dev \
-            libboost-iostreams-dev \
             tshark \
             tcpdump \
             iproute2 \
@@ -61,12 +54,34 @@ jobs:
             net-tools \
             lsof
 
+      - name: Install MongoDB
+        run: |
+          curl -fsSL https://pgp.mongodb.com/server-8.0.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+
+          echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/8.0 multiverse" \
+            | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
+
+          sudo apt-get update
+          sudo apt-get install -y mongodb-org
+
+          sudo systemctl start mongod
+          sudo systemctl status mongod --no-pager
+
+      - name: Install Open5GS
+        run: |
+          sudo add-apt-repository -y ppa:open5gs/latest
+          sudo apt-get update
+          sudo apt-get install -y open5gs
+
+          open5gs-mmed --version || true
+          open5gs-hssd --version || true
+
       - name: Build srsRAN 4G
         run: |
           git clone --depth 1 https://github.com/srsran/srsRAN_4G.git srsRAN_4G
 
           cd srsRAN_4G
-
           mkdir build
           cd build
 
@@ -75,19 +90,14 @@ jobs:
             -DENABLE_ZEROMQ=ON \
             -DENABLE_SRSUE=ON \
             -DENABLE_SRSENB=ON \
-            -DENABLE_SRSEPC=ON \
+            -DENABLE_SRSEPC=OFF \
             -DENABLE_GUI=OFF \
             -DENABLE_UHD=OFF \
             -DENABLE_BLADERF=OFF \
-            -DENABLE_SOAPYSDR=OFF \
-            -DENABLE_TTCN3=OFF \
-            -DENABLE_ZMQ_TEST=ON
+            -DENABLE_SOAPYSDR=OFF
 
           make -j"$(nproc)"
 
-      - name: Install srsRAN
-        run: |
-          cd srsRAN_4G/build
           sudo make install
           sudo ldconfig
 
@@ -95,51 +105,44 @@ jobs:
         run: |
           which srsenb
           which srsue
-          which srsepc
 
           srsenb --version || true
           srsue --version || true
-          srsepc --version || true
 
-      - name: Install Open5GS
-        run: |
-          sudo add-apt-repository -y ppa:open5gs/latest
-          sudo apt-get update
-          sudo apt-get install -y open5gs mongodb-org
-
-      - name: Start MongoDB
-        run: |
-          sudo systemctl start mongod
-          sudo systemctl status mongod --no-pager
-
-      - name: Prepare LTE network
+      - name: Configure Open5GS
         run: |
           chmod +x scripts/run-lte-lab.sh
           sudo ./scripts/run-lte-lab.sh prepare
 
-      - name: Start LTE lab
+      - name: Start Open5GS
         run: |
-          sudo ./scripts/run-lte-lab.sh start
+          sudo ./scripts/run-lte-lab.sh start-core
 
-      - name: Run LTE test
+      - name: Start LTE eNodeB
         run: |
-          sudo ./scripts/run-lte-lab.sh test
+          sudo ./scripts/run-lte-lab.sh start-enb
 
-      - name: Collect logs
+      - name: Run LTE UE
+        run: |
+          sudo ./scripts/run-lte-lab.sh test-ue
+
+      - name: Collect diagnostics
         if: always()
         run: |
           mkdir -p artifacts
 
-          sudo cp -a /var/log/open5gs artifacts/open5gs 2>/dev/null || true
+          sudo cp -a /var/log/open5gs \
+            artifacts/open5gs 2>/dev/null || true
 
-          sudo cp -a /tmp/lte-lab artifacts/lte-lab 2>/dev/null || true
+          sudo cp -a /tmp/lte-lab \
+            artifacts/lte-lab 2>/dev/null || true
 
-          sudo journalctl -u mongod \
+          sudo journalctl \
             --no-pager \
-            > artifacts/mongodb.log 2>&1 || true
+            > artifacts/journal.log 2>&1 || true
 
           sudo ss -lntup \
-            > artifacts/network-sockets.txt 2>&1 || true
+            > artifacts/sockets.txt 2>&1 || true
 
           sudo ip addr \
             > artifacts/ip-addresses.txt 2>&1 || true
