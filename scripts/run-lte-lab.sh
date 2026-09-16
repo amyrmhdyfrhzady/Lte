@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-set -e
+set -euo pipefail
 
 MODE="${1:-}"
 
@@ -8,10 +8,7 @@ LAB_DIR="/tmp/lte-lab"
 CONFIG_DIR="$(cd "$(dirname "$0")/../configs" && pwd)"
 
 ENB_CONF="$CONFIG_DIR/enb.conf"
-EPC_CONF="$CONFIG_DIR/epc.conf"
 UE_CONF="$CONFIG_DIR/ue.conf"
-
-mkdir -p "$LAB_DIR"
 
 log() {
     echo
@@ -22,63 +19,115 @@ log() {
 }
 
 prepare() {
-    log "Preparing LTE lab"
+    log "Preparing LTE Lab"
 
     mkdir -p "$LAB_DIR"
 
-    rm -f \
-        "$LAB_DIR"/*.log \
-        "$LAB_DIR"/*.pcap \
-        "$LAB_DIR"/*.pcapng \
-        "$LAB_DIR"/*.pid
+    rm -f "$LAB_DIR"/*.log
+    rm -f "$LAB_DIR"/*.pcap
+    rm -f "$LAB_DIR"/*.pcapng
+    rm -f "$LAB_DIR"/*.pid
 
-    echo "LTE-LAB" > "$LAB_DIR/status"
+    ip netns del ue1 2>/dev/null || true
+    ip link del ogstun 2>/dev/null || true
 
-    ip link show ogstun >/dev/null 2>&1 || true
+    ip netns add ue1
+
+    echo "Creating Open5GS TUN interface"
+
+    ip tuntap add name ogstun mode tun
+    ip addr add 10.45.0.1/16 dev ogstun
+    ip link set ogstun up
+
+    echo "Creating test subscriber"
+
+    mongosh \
+      --quiet \
+      --eval '
+        db = db.getSiblingDB("open5gs");
+
+        db.subscribers.deleteMany({
+          imsi: "901700123456789"
+        });
+
+        db.subscribers.insertOne({
+          imsi: "901700123456789",
+          security: {
+            k: "00112233445566778899AABBCCDDEEFF",
+            opc: "63BFA50EE6523365FF14C1F45F88737D",
+            amf: "8000"
+          },
+          ambr: {
+            downlink: { value: 1, unit: 3 },
+            uplink: { value: 1, unit: 3 }
+          },
+          slice: [
+            {
+              sst: 1,
+              default_indicator: true,
+              session: [
+                {
+                  name: "internet",
+                  type: 3,
+                  qos: {
+                    index: 9,
+                    arp: 1
+                  }
+                }
+              ]
+            }
+          ]
+        });
+      ' \
+      > "$LAB_DIR/subscriber.log" 2>&1 || true
 
     echo "Preparation complete."
 }
 
-start() {
-    log "Starting LTE lab"
+start_core() {
+    log "Starting Open5GS EPC"
+
+    sudo systemctl restart open5gs-mmed
+    sudo systemctl restart open5gs-hssd
+    sudo systemctl restart open5gs-pcrfd
+    sudo systemctl restart open5gs-sgwcd
+    sudo systemctl restart open5gs-sgwud
+    sudo systemctl restart open5gs-pgwd
+
+    sleep 5
+
+    echo "Open5GS services:"
+    systemctl --no-pager --type=service \
+      | grep open5gs || true
+
+    echo
+    echo "Open5GS sockets:"
+    ss -lntup | grep -E '36412|2123|2152|3868' || true
+}
+
+start_enb() {
+    log "Starting srsENB"
 
     mkdir -p "$LAB_DIR"
 
-    if pgrep -x srsepc >/dev/null 2>&1; then
-        echo "srsepc is already running."
-    else
-        echo "Starting srsEPC..."
-
-        srsepc \
-            "$EPC_CONF" \
-            > "$LAB_DIR/srsepc.log" 2>&1 &
-
-        echo $! > "$LAB_DIR/srsepc.pid"
-
-        sleep 5
-    fi
-
     if pgrep -x srsenb >/dev/null 2>&1; then
         echo "srsENB is already running."
-    else
-        echo "Starting srsENB..."
-
-        srsenb \
-            "$ENB_CONF" \
-            > "$LAB_DIR/srsenb.log" 2>&1 &
-
-        echo $! > "$LAB_DIR/srsenb.pid"
-
-        sleep 5
+        return
     fi
 
-    echo
-    echo "Running LTE processes:"
-    pgrep -a -f 'srsepc|srsenb' || true
+    srsenb "$ENB_CONF" \
+      > "$LAB_DIR/srsenb.log" 2>&1 &
+
+    echo $! > "$LAB_DIR/srsenb.pid"
+
+    sleep 8
+
+    echo "srsENB process:"
+    pgrep -a -x srsenb || true
 }
 
-test_lte() {
-    log "Starting LTE UE"
+test_ue() {
+    log "Starting srsUE"
 
     if pgrep -x srsue >/dev/null 2>&1; then
         echo "srsUE is already running."
@@ -86,63 +135,61 @@ test_lte() {
     fi
 
     timeout 90 \
-        srsue "$UE_CONF" \
-        > "$LAB_DIR/srsue.log" 2>&1 || true
+      ip netns exec ue1 \
+      srsue "$UE_CONF" \
+      > "$LAB_DIR/srsue.log" 2>&1 || true
 
     echo
     echo "UE test finished."
+
+    echo
+    echo "UE log:"
+    cat "$LAB_DIR/srsue.log" || true
 }
 
 stop() {
-    log "Stopping LTE lab"
-
-    if [ -f "$LAB_DIR/srsue.pid" ]; then
-        kill "$(cat "$LAB_DIR/srsue.pid")" 2>/dev/null || true
-    fi
-
-    if [ -f "$LAB_DIR/srsenb.pid" ]; then
-        kill "$(cat "$LAB_DIR/srsenb.pid")" 2>/dev/null || true
-    fi
-
-    if [ -f "$LAB_DIR/srsepc.pid" ]; then
-        kill "$(cat "$LAB_DIR/srsepc.pid")" 2>/dev/null || true
-    fi
+    log "Stopping LTE Lab"
 
     pkill -x srsue 2>/dev/null || true
     pkill -x srsenb 2>/dev/null || true
-    pkill -x srsepc 2>/dev/null || true
 
-    sleep 2
+    sudo systemctl stop open5gs-pgwd 2>/dev/null || true
+    sudo systemctl stop open5gs-sgwud 2>/dev/null || true
+    sudo systemctl stop open5gs-sgwcd 2>/dev/null || true
+    sudo systemctl stop open5gs-pcrfd 2>/dev/null || true
+    sudo systemctl stop open5gs-hssd 2>/dev/null || true
+    sudo systemctl stop open5gs-mmed 2>/dev/null || true
 
-    echo "LTE lab stopped."
+    ip netns del ue1 2>/dev/null || true
+    ip link del ogstun 2>/dev/null || true
+
+    echo "LTE Lab stopped."
 }
 
 case "$MODE" in
-
     prepare)
         prepare
         ;;
-
-    start)
-        start
+    start-core)
+        start_core
         ;;
-
-    test)
-        test_lte
+    start-enb)
+        start_enb
         ;;
-
+    test-ue)
+        test_ue
+        ;;
     stop)
         stop
         ;;
-
     *)
         echo "Usage:"
         echo
         echo "  $0 prepare"
-        echo "  $0 start"
-        echo "  $0 test"
+        echo "  $0 start-core"
+        echo "  $0 start-enb"
+        echo "  $0 test-ue"
         echo "  $0 stop"
         exit 1
         ;;
-
 esac
