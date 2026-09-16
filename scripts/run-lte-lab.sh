@@ -28,35 +28,93 @@ prepare() {
     rm -f "$LAB_DIR"/*.pcapng
     rm -f "$LAB_DIR"/*.pid
 
+    echo "Cleaning previous processes..."
+
+    sudo pkill -x srsue 2>/dev/null || true
+    sudo pkill -x srsenb 2>/dev/null || true
+
     ip netns del ue1 2>/dev/null || true
     ip link del ogstun 2>/dev/null || true
 
+    echo "Configuring Open5GS MME PLMN/TAC..."
+
+    sudo python3 - <<'PY'
+from pathlib import Path
+
+path = Path("/etc/open5gs/mme.yaml")
+text = path.read_text()
+
+replacements = {
+    "        mcc: 999": "        mcc: 901",
+    "        mnc: 70": "        mnc: 70",
+    "      tac: 1": "      tac: 7",
+}
+
+lines = text.splitlines()
+
+section = None
+
+for i, line in enumerate(lines):
+
+    if line.strip() == "gummei:":
+        section = "gummei"
+        continue
+
+    if line.strip() == "tai:":
+        section = "tai"
+        continue
+
+    if section == "gummei":
+        if "mcc:" in line:
+            lines[i] = "        mcc: 901"
+        elif "mnc:" in line:
+            lines[i] = "        mnc: 70"
+
+    elif section == "tai":
+        if "mcc:" in line:
+            lines[i] = "        mcc: 901"
+        elif "mnc:" in line:
+            lines[i] = "        mnc: 70"
+        elif "tac:" in line:
+            lines[i] = "      tac: 7"
+
+path.write_text("\n".join(lines) + "\n")
+PY
+
+    echo "MME PLMN/TAC:"
+    sudo grep -A18 -E "gummei:|tai:" /etc/open5gs/mme.yaml || true
+
+    echo
     echo "Creating UE network namespace..."
 
     ip netns add ue1
 
+    echo
     echo "Creating Open5GS TUN interface..."
 
     ip tuntap add name ogstun mode tun
     ip addr add 10.45.0.1/16 dev ogstun
     ip link set ogstun up
 
+    echo
     echo "Enabling IPv4 forwarding..."
 
-    sysctl -w net.ipv4.ip_forward=1
+    sudo sysctl -w net.ipv4.ip_forward=1
 
+    echo
     echo "Adding NAT..."
 
-    iptables -t nat -D POSTROUTING \
+    sudo iptables -t nat -D POSTROUTING \
         -s 10.45.0.0/16 \
         ! -o ogstun \
         -j MASQUERADE 2>/dev/null || true
 
-    iptables -t nat -A POSTROUTING \
+    sudo iptables -t nat -A POSTROUTING \
         -s 10.45.0.0/16 \
         ! -o ogstun \
         -j MASQUERADE
 
+    echo
     echo "Creating test subscriber..."
 
     mongosh \
@@ -110,8 +168,21 @@ prepare() {
       ' \
       > "$LAB_DIR/subscriber.log" 2>&1
 
+    echo
     echo "Subscriber database result:"
     cat "$LAB_DIR/subscriber.log" || true
+
+    echo
+    echo "Checking srsRAN configuration files..."
+
+    echo
+    echo "Installed srsRAN configuration locations:"
+
+    find /usr/local/etc /etc /usr/share \
+        -type f \
+        \( -name "sib.conf*" -o -name "rr.conf*" -o -name "drb.conf*" \) \
+        2>/dev/null \
+        | head -n 50 || true
 
     echo
     echo "Preparation complete."
@@ -130,34 +201,42 @@ start_core() {
     sudo systemctl stop open5gs-hssd 2>/dev/null || true
     sudo systemctl stop open5gs-pcrfd 2>/dev/null || true
 
+    echo
     echo "Starting MongoDB..."
 
     sudo systemctl restart mongod
 
+    echo
     echo "Starting HSS..."
 
     sudo systemctl restart open5gs-hssd
 
+    echo
     echo "Starting PCRF..."
 
     sudo systemctl restart open5gs-pcrfd
 
+    echo
     echo "Starting MME..."
 
     sudo systemctl restart open5gs-mmed
 
+    echo
     echo "Starting SGW Control Plane..."
 
     sudo systemctl restart open5gs-sgwcd
 
+    echo
     echo "Starting SMF / PGW Control Plane..."
 
     sudo systemctl restart open5gs-smfd
 
+    echo
     echo "Starting SGW User Plane..."
 
     sudo systemctl restart open5gs-sgwud
 
+    echo
     echo "Starting UPF / PGW User Plane..."
 
     sudo systemctl restart open5gs-upfd
@@ -187,6 +266,14 @@ start_core() {
     ss -lntup | grep -E \
         '36412|2123|2152|3868|8805' \
         || true
+
+    echo
+    echo "============================================================"
+    echo "MME PLMN/TAC"
+    echo "============================================================"
+
+    sudo grep -A18 -E "gummei:|tai:" \
+        /etc/open5gs/mme.yaml || true
 }
 
 start_enb() {
@@ -199,6 +286,18 @@ start_enb() {
         return
     fi
 
+    echo "Checking eNB configuration..."
+
+    if [ ! -f "$ENB_CONF" ]; then
+        echo "ERROR: $ENB_CONF not found."
+        exit 1
+    fi
+
+    echo
+    echo "eNB configuration:"
+    cat "$ENB_CONF"
+
+    echo
     echo "Starting srsENB..."
 
     srsenb "$ENB_CONF" \
@@ -209,14 +308,25 @@ start_enb() {
     sleep 10
 
     echo
-    echo "srsENB process:"
+    echo "============================================================"
+    echo "srsENB PROCESS"
+    echo "============================================================"
 
     pgrep -a -x srsenb || true
 
     echo
-    echo "srsENB log:"
+    echo "============================================================"
+    echo "srsENB LOG"
+    echo "============================================================"
 
-    tail -n 100 "$LAB_DIR/srsenb.log" || true
+    tail -n 150 "$LAB_DIR/srsenb.log" || true
+
+    echo
+    echo "============================================================"
+    echo "S1AP SOCKET"
+    echo "============================================================"
+
+    ss -lnp | grep 36412 || true
 }
 
 test_ue() {
@@ -240,16 +350,51 @@ test_ue() {
     echo "============================================================"
 
     cat "$LAB_DIR/srsue.log" || true
+
+    echo
+    echo "============================================================"
+    echo "UE NETWORK INTERFACES"
+    echo "============================================================"
+
+    ip netns exec ue1 ip addr || true
+
+    echo
+    echo "============================================================"
+    echo "UE ROUTES"
+    echo "============================================================"
+
+    ip netns exec ue1 ip route || true
+
+    echo
+    echo "============================================================"
+    echo "Open5GS UE INFO"
+    echo "============================================================"
+
+    curl -s \
+        "http://127.0.0.2:9090/ue-info?" \
+        || true
+
+    echo
+    echo
+    echo "============================================================"
+    echo "Open5GS eNB INFO"
+    echo "============================================================"
+
+    curl -s \
+        "http://127.0.0.2:9090/enb-info?" \
+        || true
 }
 
 stop() {
     log "Stopping LTE Lab"
 
     echo "Stopping srsUE..."
-    pkill -x srsue 2>/dev/null || true
+
+    sudo pkill -x srsue 2>/dev/null || true
 
     echo "Stopping srsENB..."
-    pkill -x srsenb 2>/dev/null || true
+
+    sudo pkill -x srsenb 2>/dev/null || true
 
     echo "Stopping Open5GS..."
 
@@ -271,7 +416,7 @@ stop() {
 
     echo "Removing NAT rule..."
 
-    iptables -t nat -D POSTROUTING \
+    sudo iptables -t nat -D POSTROUTING \
         -s 10.45.0.0/16 \
         ! -o ogstun \
         -j MASQUERADE 2>/dev/null || true
