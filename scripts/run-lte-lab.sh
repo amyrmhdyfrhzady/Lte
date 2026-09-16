@@ -4,8 +4,12 @@ set -euo pipefail
 
 MODE="${1:-}"
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 LAB_DIR="/tmp/lte-lab"
-CONFIG_DIR="$(cd "$(dirname "$0")/../configs" && pwd)"
+CONFIG_DIR="$PROJECT_DIR/configs"
+SRSRAN_DIR="$PROJECT_DIR/srsRAN_4G"
 
 ENB_CONF="$CONFIG_DIR/enb.conf"
 UE_CONF="$CONFIG_DIR/ue.conf"
@@ -18,7 +22,230 @@ log() {
     echo
 }
 
+prepare_srsran_configs() {
+
+    log "Preparing srsRAN configuration files"
+
+    mkdir -p "$CONFIG_DIR"
+
+    if [ ! -d "$SRSRAN_DIR" ]; then
+        echo "ERROR: srsRAN_4G directory not found:"
+        echo "$SRSRAN_DIR"
+        exit 1
+    fi
+
+    echo "Using srsRAN source:"
+    echo "$SRSRAN_DIR"
+
+    ENB_EXAMPLE="$SRSRAN_DIR/srsenb/enb.conf.example"
+    SIB_EXAMPLE="$SRSRAN_DIR/srsenb/sib.conf.example"
+    RR_EXAMPLE="$SRSRAN_DIR/srsenb/rr.conf.example"
+    RB_EXAMPLE="$SRSRAN_DIR/srsenb/rb.conf.example"
+    UE_EXAMPLE="$SRSRAN_DIR/srsue/ue.conf.example"
+
+    for file in \
+        "$ENB_EXAMPLE" \
+        "$SIB_EXAMPLE" \
+        "$RR_EXAMPLE" \
+        "$RB_EXAMPLE" \
+        "$UE_EXAMPLE"
+    do
+        if [ ! -f "$file" ]; then
+            echo "ERROR: Missing srsRAN example:"
+            echo "$file"
+            exit 1
+        fi
+    done
+
+    echo
+    echo "Copying version-matched srsRAN examples..."
+
+    cp "$ENB_EXAMPLE" "$ENB_CONF"
+    cp "$SIB_EXAMPLE" "$CONFIG_DIR/sib.conf"
+    cp "$RR_EXAMPLE" "$CONFIG_DIR/rr.conf"
+    cp "$RB_EXAMPLE" "$CONFIG_DIR/rb.conf"
+    cp "$UE_EXAMPLE" "$UE_CONF"
+
+    echo "srsRAN configuration files created."
+
+    echo
+    echo "Patching eNB configuration..."
+
+    python3 - "$ENB_CONF" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+
+def replace(text, old, new):
+    if old in text:
+        return text.replace(old, new, 1)
+    return text
+
+text = replace(text, "mcc = 001", "mcc = 901")
+text = replace(text, "mnc = 01", "mnc = 70")
+
+text = replace(text, "#device_name = zmq", "device_name = zmq")
+text = replace(
+    text,
+    "#device_args = fail_on_disconnect=true,tx_port=tcp://*:2000,rx_port=tcp://localhost:2001,id=enb,base_srate=23.04e6",
+    "device_args = fail_on_disconnect=true,tx_port=tcp://*:2000,rx_port=tcp://127.0.0.1:2001,id=enb,base_srate=23.04e6"
+)
+
+path.write_text(text)
+PY
+
+    echo
+    echo "Patching RR configuration..."
+
+    python3 - "$CONFIG_DIR/rr.conf" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+
+text = text.replace("tac = 0x0001", "tac = 0x0007")
+text = text.replace("tac = 0x0007", "tac = 0x0007")
+
+path.write_text(text)
+PY
+
+    echo
+    echo "Patching UE configuration..."
+
+    python3 - "$UE_CONF" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+
+def replace(text, old, new):
+    if old in text:
+        return text.replace(old, new, 1)
+    return text
+
+# ZMQ
+text = replace(text, "#device_name = zmq", "device_name = zmq")
+
+text = replace(
+    text,
+    "#device_args = tx_port=tcp://*:2001,rx_port=tcp://localhost:2000,id=ue,base_srate=23.04e6",
+    "device_args = tx_port=tcp://*:2001,rx_port=tcp://127.0.0.1:2000,id=ue,base_srate=23.04e6"
+)
+
+# USIM
+text = replace(text, "imsi = 001010123456780", "imsi = 901700123456789")
+text = replace(
+    text,
+    "opc  = 63BFA50EE6523365FF14C1F45F88737D",
+    "opc  = 63BFA50EE6523365FF14C1F45F88737D"
+)
+text = replace(
+    text,
+    "k    = 00112233445566778899aabbccddeeff",
+    "k    = 00112233445566778899aabbccddeeff"
+)
+
+# APN
+text = replace(text, "apn = srsapn", "apn = internet")
+
+# Remove old invalid pcap.filename if present.
+lines = []
+for line in text.splitlines():
+    stripped = line.strip()
+
+    if stripped.startswith("filename =") and "[pcap]" in "":
+        continue
+
+    if stripped == "pcap.filename":
+        continue
+
+    lines.append(line)
+
+text = "\n".join(lines) + "\n"
+
+path.write_text(text)
+PY
+
+    echo
+    echo "Forcing valid UE PCAP configuration..."
+
+    python3 - "$UE_CONF" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+
+lines = text.splitlines()
+
+out = []
+inside_pcap = False
+
+for line in lines:
+
+    stripped = line.strip()
+
+    if stripped.startswith("["):
+        inside_pcap = stripped == "[pcap]"
+
+    if inside_pcap:
+        if stripped.startswith("filename ="):
+            continue
+
+    out.append(line)
+
+text = "\n".join(out) + "\n"
+
+path.write_text(text)
+PY
+
+    echo
+    echo "Checking generated configuration files..."
+
+    ls -lh \
+        "$ENB_CONF" \
+        "$CONFIG_DIR/sib.conf" \
+        "$CONFIG_DIR/rr.conf" \
+        "$CONFIG_DIR/rb.conf" \
+        "$UE_CONF"
+
+    echo
+    echo "============================================================"
+    echo "eNB RF configuration"
+    echo "============================================================"
+
+    grep -A8 -B3 \
+        -E "device_name|device_args" \
+        "$ENB_CONF" || true
+
+    echo
+    echo "============================================================"
+    echo "UE RF configuration"
+    echo "============================================================"
+
+    grep -A8 -B3 \
+        -E "device_name|device_args" \
+        "$UE_CONF" || true
+
+    echo
+    echo "============================================================"
+    echo "UE USIM"
+    echo "============================================================"
+
+    grep -A12 \
+        "^\[usim\]" \
+        "$UE_CONF" || true
+
+    echo
+    echo "srsRAN configuration preparation complete."
+}
+
 prepare() {
+
     log "Preparing LTE Lab"
 
     mkdir -p "$LAB_DIR"
@@ -36,6 +263,9 @@ prepare() {
     ip netns del ue1 2>/dev/null || true
     ip link del ogstun 2>/dev/null || true
 
+    prepare_srsran_configs
+
+    echo
     echo "Configuring Open5GS MME PLMN/TAC..."
 
     sudo python3 - <<'PY'
@@ -43,12 +273,6 @@ from pathlib import Path
 
 path = Path("/etc/open5gs/mme.yaml")
 text = path.read_text()
-
-replacements = {
-    "        mcc: 999": "        mcc: 901",
-    "        mnc: 70": "        mnc: 70",
-    "      tac: 1": "      tac: 7",
-}
 
 lines = text.splitlines()
 
@@ -65,24 +289,33 @@ for i, line in enumerate(lines):
         continue
 
     if section == "gummei":
-        if "mcc:" in line:
+
+        if "mcc:" in line and not line.lstrip().startswith("#"):
             lines[i] = "        mcc: 901"
-        elif "mnc:" in line:
+
+        elif "mnc:" in line and not line.lstrip().startswith("#"):
             lines[i] = "        mnc: 70"
 
     elif section == "tai":
-        if "mcc:" in line:
+
+        if "mcc:" in line and not line.lstrip().startswith("#"):
             lines[i] = "        mcc: 901"
-        elif "mnc:" in line:
+
+        elif "mnc:" in line and not line.lstrip().startswith("#"):
             lines[i] = "        mnc: 70"
-        elif "tac:" in line:
+
+        elif "tac:" in line and not line.lstrip().startswith("#"):
             lines[i] = "      tac: 7"
 
 path.write_text("\n".join(lines) + "\n")
 PY
 
+    echo
     echo "MME PLMN/TAC:"
-    sudo grep -A18 -E "gummei:|tai:" /etc/open5gs/mme.yaml || true
+
+    sudo grep -A18 -E \
+        "gummei:|tai:" \
+        /etc/open5gs/mme.yaml || true
 
     echo
     echo "Creating UE network namespace..."
@@ -107,7 +340,8 @@ PY
     sudo iptables -t nat -D POSTROUTING \
         -s 10.45.0.0/16 \
         ! -o ogstun \
-        -j MASQUERADE 2>/dev/null || true
+        -j MASQUERADE \
+        2>/dev/null || true
 
     sudo iptables -t nat -A POSTROUTING \
         -s 10.45.0.0/16 \
@@ -173,22 +407,11 @@ PY
     cat "$LAB_DIR/subscriber.log" || true
 
     echo
-    echo "Checking srsRAN configuration files..."
-
-    echo
-    echo "Installed srsRAN configuration locations:"
-
-    find /usr/local/etc /etc /usr/share \
-        -type f \
-        \( -name "sib.conf*" -o -name "rr.conf*" -o -name "drb.conf*" \) \
-        2>/dev/null \
-        | head -n 50 || true
-
-    echo
     echo "Preparation complete."
 }
 
 start_core() {
+
     log "Starting Open5GS 4G EPC"
 
     echo "Stopping old Open5GS processes..."
@@ -272,11 +495,13 @@ start_core() {
     echo "MME PLMN/TAC"
     echo "============================================================"
 
-    sudo grep -A18 -E "gummei:|tai:" \
+    sudo grep -A18 -E \
+        "gummei:|tai:" \
         /etc/open5gs/mme.yaml || true
 }
 
 start_enb() {
+
     log "Starting srsENB"
 
     mkdir -p "$LAB_DIR"
@@ -286,22 +511,30 @@ start_enb() {
         return
     fi
 
-    echo "Checking eNB configuration..."
-
     if [ ! -f "$ENB_CONF" ]; then
         echo "ERROR: $ENB_CONF not found."
         exit 1
     fi
 
-    echo
-    echo "eNB configuration:"
-    cat "$ENB_CONF"
+    for file in \
+        "$CONFIG_DIR/sib.conf" \
+        "$CONFIG_DIR/rr.conf" \
+        "$CONFIG_DIR/rb.conf"
+    do
+        if [ ! -f "$file" ]; then
+            echo "ERROR: Missing eNB configuration:"
+            echo "$file"
+            exit 1
+        fi
+    done
 
-    echo
-    echo "Starting srsENB..."
+    echo "Starting srsENB from configuration directory..."
 
-    srsenb "$ENB_CONF" \
-        > "$LAB_DIR/srsenb.log" 2>&1 &
+    (
+        cd "$CONFIG_DIR"
+
+        srsenb "$ENB_CONF"
+    ) > "$LAB_DIR/srsenb.log" 2>&1 &
 
     echo $! > "$LAB_DIR/srsenb.pid"
 
@@ -319,7 +552,8 @@ start_enb() {
     echo "srsENB LOG"
     echo "============================================================"
 
-    tail -n 150 "$LAB_DIR/srsenb.log" || true
+    tail -n 200 \
+        "$LAB_DIR/srsenb.log" || true
 
     echo
     echo "============================================================"
@@ -330,6 +564,7 @@ start_enb() {
 }
 
 test_ue() {
+
     log "Starting srsUE"
 
     if pgrep -x srsue >/dev/null 2>&1; then
@@ -337,12 +572,21 @@ test_ue() {
         return
     fi
 
+    if [ ! -f "$UE_CONF" ]; then
+        echo "ERROR: $UE_CONF not found."
+        exit 1
+    fi
+
     echo "Starting srsUE inside ue1 namespace..."
 
     timeout 120 \
         ip netns exec ue1 \
-        srsue "$UE_CONF" \
-        > "$LAB_DIR/srsue.log" 2>&1 || true
+        bash -c "
+            cd '$CONFIG_DIR'
+            exec srsue '$UE_CONF'
+        " \
+        > "$LAB_DIR/srsue.log" 2>&1 \
+        || true
 
     echo
     echo "============================================================"
@@ -386,6 +630,7 @@ test_ue() {
 }
 
 stop() {
+
     log "Stopping LTE Lab"
 
     echo "Stopping srsUE..."
@@ -419,7 +664,8 @@ stop() {
     sudo iptables -t nat -D POSTROUTING \
         -s 10.45.0.0/16 \
         ! -o ogstun \
-        -j MASQUERADE 2>/dev/null || true
+        -j MASQUERADE \
+        2>/dev/null || true
 
     echo
     echo "LTE Lab stopped."
